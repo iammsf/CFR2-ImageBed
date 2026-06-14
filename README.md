@@ -1,6 +1,6 @@
 # ImgBed
 
-基于 **Cloudflare Workers + R2 + D1** 的自托管图床，带完整 Web 管理界面。静态资源走 Cloudflare CDN，API 与图片直链由 Worker 处理。
+基于 **Cloudflare Workers + R2 + D1** 的自托管图床，带完整 Web 管理界面。静态资源走 Cloudflare CDN，API 与图片直链由 Worker 处理。代码由AI完成90%以上。
 
 ![License](https://img.shields.io/badge/License-MIT-green.svg)
 ![Cloudflare](https://img.shields.io/badge/Cloudflare-Workers-F38020?logo=cloudflare&logoColor=white)
@@ -56,9 +56,11 @@
 | 运行时 | Cloudflare Workers |
 | 对象存储 | Cloudflare R2 |
 | 元数据 | Cloudflare D1 (SQLite) |
-| 前端 | 原生 HTML / CSS / JavaScript（无构建步骤） |
+| 前端 | 原生 HTML / CSS / JavaScript（无构建、无 Node 运行时） |
 | 鉴权 | JWT（Cookie + Bearer） |
-| 部署 | Wrangler 4 |
+| 部署 | [Wrangler](https://developers.cloudflare.com/workers/wrangler/) CLI |
+
+> **本项目线上不跑 Node.js。** Worker 在 Cloudflare 边缘执行，前端为纯静态文件。本地只有用 Wrangler 开发/部署时才需要 Node 环境（或使用 `npx wrangler` 免全局安装）。
 
 ## 项目结构
 
@@ -72,27 +74,63 @@ imgbed/
 ├── init.sql           # D1 初始化脚本
 ├── migrations/        # 旧库增量迁移 SQL
 ├── wrangler.toml      # Workers / R2 / D1 绑定
+├── package.json       # 仅一键部署用（deploy 脚本与 JWT 说明，无 npm 依赖）
 ├── .dev.vars.example  # 本地密钥示例
-└── package.json
+└── LICENSE
 ```
 
 ## 快速开始
 
-### 1. 前置要求
+### 一键部署到 Cloudflare
 
-- [Node.js](https://nodejs.org/) 18+
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/iammsf/CFR2-ImageBed)
+
+适合不想本地装 Wrangler 的用户。点击后会：
+
+1. 授权 Cloudflare / GitHub，在你的账号下 **Fork 一份仓库**
+2. 按 `wrangler.toml` **自动创建** R2 桶、D1 数据库并绑定 Worker
+3. 在向导里填写 **`JWT_SECRET`**（部署密钥）
+4. 通过 Workers Builds **构建并部署**（含执行 `init.sql` 初始化表结构）
+5. 打开分配的 `*.workers.dev` 地址，进入 **安装向导** 创建管理员
+
+#### 一键部署注意事项
+
+| 项目 | 说明 |
+|------|------|
+| 公开仓库 | 源仓库必须为 **Public**，否则他人无法使用此按钮 |
+| Git 平台 | 仅支持 **GitHub / GitLab.com**（不支持 Gitee、自建 GitLab） |
+| Fork 副本 | 部署会在 **你的 GitHub** 新建仓库，后续改代码推送到该仓库即可自动再部署 |
+| `JWT_SECRET` | 在 Cloudflare 部署页填写，**不要**写进 `wrangler.toml` 或提交到 Git |
+| D1 初始化 | 首次部署会通过 `package.json` 的 `deploy` 脚本执行 `init.sql`；若表已存在，重复执行一般无害（`IF NOT EXISTS`） |
+| R2 公开访问 | 一键部署 **不会** 自动绑定自定义域名；安装向导或管理页填写 `r2_public_url`（R2 自定义域或 `*.r2.dev`） |
+| 图片直链 | 未配置 `r2_public_url` 时，直链走 Worker 域名 `https://<worker>.workers.dev/<路径>` |
+| 自定义域名 | 需在 Cloudflare Dashboard → Workers → 你的 Worker → **Domains** 中手动绑定 |
+| 资源改名 | 向导里若修改 R2 桶名 / D1 名 / Worker 名，Cloudflare 会写回 Fork 仓库中的 `wrangler.toml` |
+| 费用 | R2、D1、Workers 均有免费额度，超出按 [Cloudflare 定价](https://www.cloudflare.com/plans/) 计费 |
+
+部署完成后若无法登录或页面异常，请到 Dashboard 确认 **Secrets** 中已有 `JWT_SECRET`，并访问 Worker 的 **Logs** 排查。
+
+---
+
+### 手动部署
+
+适合需要完全掌控配置，或在本地调试的场景。
+
+#### 1. 前置要求
+
 - Cloudflare 账号
-- [Wrangler CLI](https://developers.cloudflare.com/workers/wrangler/)（`npm i -g wrangler` 或由项目依赖提供）
+- [Wrangler CLI](https://developers.cloudflare.com/workers/wrangler/)（任选一种安装方式）：
+  - 全局：`npm i -g wrangler`
+  - 免安装：下文命令前加 `npx`（需本机有 Node.js）
 
-### 2. 安装依赖
+#### 2. 获取代码
 
 ```bash
 git clone <your-repo-url>
 cd imgbed
-npm install
 ```
 
-### 3. 创建 Cloudflare 资源
+#### 3. 创建 Cloudflare 资源
 
 1. **R2 存储桶**：Dashboard → R2 → Create bucket（例如 `images`）
 2. **D1 数据库**：
@@ -105,7 +143,7 @@ npm install
 
 3. **（可选）R2 公开域名**：为 bucket 绑定自定义域名或 `r2.dev` 子域，安装向导或管理页中填写 `r2_public_url`。
 
-### 4. 修改配置
+#### 4. 修改配置
 
 编辑 `wrangler.toml`：
 
@@ -122,7 +160,7 @@ database_name = "imgbed"
 database_id = "<你的 database_id>"
 ```
 
-### 5. 配置 JWT 密钥
+#### 5. 配置 JWT 密钥
 
 **本地开发**：复制示例并填写随机长字符串
 
@@ -139,30 +177,30 @@ wrangler secret put JWT_SECRET
 
 > 切勿将 `JWT_SECRET` 提交到 Git。`.dev.vars` 已在 `.gitignore` 中忽略。
 
-### 6. 初始化数据库
+#### 6. 初始化数据库
 
 ```bash
 # 远程（生产）
-npm run db:init
+wrangler d1 execute imgbed --remote --file=./init.sql
 
 # 本地开发库
-npm run db:init:local
+wrangler d1 execute imgbed --local --file=./init.sql
 ```
 
 已有旧版本数据库时，可额外执行 `migrations/` 下对应 SQL；新部署通常只需 `init.sql`。Worker 启动时也会自动执行部分 schema 迁移。
 
-### 7. 部署
+#### 7. 部署
 
 ```bash
-npm run deploy
+wrangler deploy
 ```
 
 首次访问站点会进入**安装向导**：创建管理员账号并设置 R2 公开 URL。
 
-### 8. 本地开发
+#### 8. 本地开发
 
 ```bash
-npm run dev
+wrangler dev
 ```
 
 浏览器打开 Wrangler 提示的本地地址即可调试。

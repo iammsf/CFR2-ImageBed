@@ -1,15 +1,15 @@
 {
-  "name": "my-imgbed",
-  "version": "1.0.0",
-  "description": "Cloudflare Workers 图床 - 网页端管理",
+  "name": "cfr2-imagebed",
+  "private": true,
   "license": "MIT",
   "scripts": {
-    "dev": "wrangler dev",
-    "deploy": "wrangler deploy",
-    "db:init": "wrangler d1 execute imgbed --remote --file=./init.sql",
-    "db:init:local": "wrangler d1 execute imgbed --local --file=./init.sql"
+    "deploy": "wrangler d1 execute imgbed --remote --file=./init.sql && wrangler deploy"
   },
-  "devDependencies": {
-    "wrangler": "^4.0.0"
+  "cloudflare": {
+    "bindings": {
+      "JWT_SECRET": {
+        "description": "JWT 签名密钥，用于登录鉴权。可执行 `openssl rand -hex 32` 生成随机字符串，至少 32 位。"
+      }
+    }
   }
 }
