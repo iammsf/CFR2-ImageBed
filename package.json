@@ -1,0 +1,15 @@
+{
+  "name": "my-imgbed",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Cloudflare Workers 图床 - 网页端管理",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:init": "wrangler d1 execute imgbed --remote --file=./init.sql",
+    "db:init:local": "wrangler d1 execute imgbed --local --file=./init.sql"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}

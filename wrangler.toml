@@ -1,0 +1,27 @@
+name = "my-imgbed"
+main = "worker.js"
+compatibility_date = "2026-06-13"
+
+[assets]
+directory = "./public"
+binding = "ASSETS"
+# 静态资源直出 CDN，不经过 Worker，显著降低 CSS/JS/首页延迟
+run_worker_first = false
+
+# JWT 请在本地 .dev.vars 或 Cloudflare Dashboard / wrangler secret 中配置，勿提交到 Git
+# 本地开发：复制 .dev.vars.example 为 .dev.vars 并填写 JWT_SECRET
+
+# 绑定 R2 存储桶
+[[r2_buckets]]
+binding = "R2_BUCKET"
+bucket_name = "images"   # 请替换为您的 R2 存储桶名称
+
+# 绑定 D1 数据库
+[[d1_databases]]
+binding = "DB"
+database_name = "imgbed"
+database_id = "4e12b7fc-9a28-48a5-89d2-0e9d1dea0dce"   # 创建 D1 后获得
+
+# 日志和观察
+[observability]
+enabled = true
