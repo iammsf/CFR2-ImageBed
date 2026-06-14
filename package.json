@@ -1,8 +1,8 @@
 {
   "name": "my-imgbed",
   "version": "1.0.0",
-  "private": true,
   "description": "Cloudflare Workers 图床 - 网页端管理",
+  "license": "MIT",
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
