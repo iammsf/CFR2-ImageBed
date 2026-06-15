@@ -64,7 +64,7 @@ OR IGNORE INTO settings (key, value)
 VALUES
     (
         'footer_html',
-        '{"value":"<div style=\\"text-align:center; padding:16px;\\">Powered by Cloudflare</div>"}'
+        '{"value":"<div style=\\"text-align:center; padding:24px;\\"><a href=\\"https://www.github.com/iammsf/CFR2-ImageBed\\"><b>CFR2 ImageBed</b></a>  一个基于CFR2存储桶+D1数据库的图床项目，由 <a href=\\"https://www.github.com/iammsf\\"><b>電腦玩家Stan</b></a> 使用AI制作。部署在 CloudFlare Workers 上</div>"}'
     );
 
 INSERT
