@@ -126,7 +126,7 @@ imgbed/
 #### 2. 获取代码
 
 ```bash
-git clone <your-repo-url>
+git clone <https://github.com/iammsf/CFR2-ImageBed>
 cd imgbed
 ```
 
