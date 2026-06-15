@@ -74,7 +74,9 @@ async function migrateDbSchema(env) {
     const defaultSettings = [
         ['login_ban_window_sec', 900],
         ['login_ban_max_attempts', 5],
-        ['login_ban_duration_sec', 3600]
+        ['login_ban_duration_sec', 3600],
+        ['upload_success_dismiss_sec', 3],
+        ['upload_error_dismiss_sec', 5]
     ];
     for (const [key, val] of defaultSettings) {
         await env.DB.prepare('INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)')
@@ -261,6 +263,10 @@ async function handleApiInner(request, action, env, ctx) {
             const parent = normalizeParent(url.searchParams.get('parent') || '/');
             return jsonResponse(await listFiles(parent, env));
         }
+        case 'search':
+            if (method !== 'GET') return jsonResponse({ error: 'Method not allowed' }, 405);
+            if (!hasViewPermission(user)) return jsonResponse({ error: 'Forbidden' }, 403);
+            return handleSearch(url, env);
         case 'file/raw': {
             if (method !== 'GET') return jsonResponse({ error: 'Method not allowed' }, 405);
             if (!hasViewPermission(user)) return jsonResponse({ error: 'Forbidden' }, 403);
@@ -277,6 +283,10 @@ async function handleApiInner(request, action, env, ctx) {
                 const stats = await syncR2ToDB(env, { full });
                 return jsonResponse({ success: true, ...stats });
             }
+        case 'check-hash':
+            if (method !== 'POST') return jsonResponse({ error: 'Method not allowed' }, 405);
+            if (!hasUploadPermission(user)) return jsonResponse({ error: 'Forbidden' }, 403);
+            return handleCheckHash(request, user, env, ctx);
         case 'upload':
             if (!hasUploadPermission(user)) return jsonResponse({ error: 'Forbidden' }, 403);
             return await handleUpload(request, user, env, ctx);
@@ -413,6 +423,94 @@ async function listAllFolders(env) {
         'SELECT path, name, parent FROM items WHERE type = "dir" ORDER BY path ASC'
     ).all();
     return items.results;
+}
+
+const SEARCH_EXT_SUFFIXES = {
+    jpg: ['.jpg', '.jpeg'],
+    jpeg: ['.jpg', '.jpeg'],
+    png: ['.png'],
+    gif: ['.gif'],
+    webp: ['.webp'],
+    svg: ['.svg'],
+    bmp: ['.bmp'],
+    ico: ['.ico'],
+    avif: ['.avif'],
+    heic: ['.heic'],
+    heif: ['.heif'],
+    tiff: ['.tiff', '.tif'],
+    tif: ['.tiff', '.tif']
+};
+
+function escapeLikePattern(str) {
+    return String(str).replace(/\\/g, '\\\\').replace(/%/g, '\\%').replace(/_/g, '\\_');
+}
+
+function parseSearchTimestamp(value) {
+    const n = parseInt(value, 10);
+    return Number.isFinite(n) && n > 0 ? n : 0;
+}
+
+function appendExtFilter(whereParts, binds, extRaw) {
+    const ext = String(extRaw || '').trim().toLowerCase().replace(/^\./, '');
+    if (!ext) return;
+    const suffixes = SEARCH_EXT_SUFFIXES[ext] || [`.${ext}`];
+    const unique = [...new Set(suffixes)];
+    const clauses = unique.map(() => 'LOWER(name) LIKE ? ESCAPE \'\\\'');
+    whereParts.push(`(${clauses.join(' OR ')})`);
+    for (const suffix of unique) {
+        binds.push(`%${suffix}`);
+    }
+}
+
+async function handleSearch(url, env) {
+    const q = (url.searchParams.get('q') || '').trim();
+    if (!q) return jsonResponse({ error: 'Missing q' }, 400);
+    if (q.length > 200) return jsonResponse({ error: 'Query too long' }, 400);
+
+    const limit = Math.min(Math.max(parseInt(url.searchParams.get('limit') || '50', 10) || 50, 1), 100);
+    const offset = Math.max(parseInt(url.searchParams.get('offset') || '0', 10) || 0, 0);
+    const fromTs = parseSearchTimestamp(url.searchParams.get('from'));
+    const toTs = parseSearchTimestamp(url.searchParams.get('to'));
+    const sort = url.searchParams.get('sort') || 'uploaded_at';
+    const parentParam = url.searchParams.get('parent');
+    const parentScope = parentParam != null && parentParam !== '' ? normalizeParent(parentParam) : null;
+
+    const whereParts = ['type = "file"', 'name LIKE ? ESCAPE \'\\\''];
+    const binds = [`%${escapeLikePattern(q)}%`];
+
+    if (parentScope && parentScope !== '/') {
+        whereParts.push('(parent = ? OR path LIKE ? ESCAPE \'\\\')');
+        binds.push(parentScope, `${escapeLikePattern(parentScope)}/%`);
+    }
+
+    appendExtFilter(whereParts, binds, url.searchParams.get('ext'));
+
+    if (fromTs > 0) {
+        whereParts.push('uploaded_at >= ?');
+        binds.push(fromTs);
+    }
+    if (toTs > 0) {
+        whereParts.push('uploaded_at <= ?');
+        binds.push(toTs);
+    }
+
+    let orderBy = 'uploaded_at DESC, name ASC';
+    if (sort === 'name') orderBy = 'name ASC';
+    else if (sort === 'size') orderBy = 'size DESC, name ASC';
+
+    const whereClause = whereParts.join(' AND ');
+    const countRow = await env.DB.prepare(`SELECT COUNT(*) as cnt FROM items WHERE ${whereClause}`).bind(...binds).first();
+    const rows = await env.DB.prepare(
+        `SELECT ${FILE_LIST_COLUMNS} FROM items WHERE ${whereClause} ORDER BY ${orderBy} LIMIT ? OFFSET ?`
+    ).bind(...binds, limit, offset).all();
+
+    return jsonResponse({
+        items: rows.results || [],
+        total: countRow?.cnt || 0,
+        limit,
+        offset,
+        q
+    });
 }
 
 async function getR2Object(key, env) {
@@ -791,7 +889,9 @@ async function getSettings(env, ctx) {
             login_ban_max_attempts: Number(settings.login_ban_max_attempts ?? 5),
             login_ban_duration_sec: settings.login_ban_duration_sec === 0 || settings.login_ban_duration_sec === '0'
                 ? 0
-                : Number(settings.login_ban_duration_sec ?? 3600)
+                : Number(settings.login_ban_duration_sec ?? 3600),
+            upload_success_dismiss_sec: Math.min(Math.max(Number(settings.upload_success_dismiss_sec ?? 3) || 3, 1), 300),
+            upload_error_dismiss_sec: Math.min(Math.max(Number(settings.upload_error_dismiss_sec ?? 5) || 5, 1), 300)
         };
         if (ctx) ctx.waitUntil(writeCache(CACHE_SETTINGS, result, 600));
         return result;
@@ -805,7 +905,9 @@ async function getSettings(env, ctx) {
             r2_public_url: '',
             login_ban_window_sec: 900,
             login_ban_max_attempts: 5,
-            login_ban_duration_sec: 3600
+            login_ban_duration_sec: 3600,
+            upload_success_dismiss_sec: 3,
+            upload_error_dismiss_sec: 5
         };
     }
 }
@@ -862,6 +964,41 @@ function buildPublicUrl(key, settings, origin) {
 async function findFileByHash(hash, env) {
     if (!hash) return null;
     return env.DB.prepare('SELECT path, name FROM items WHERE type = "file" AND hash = ? LIMIT 1').bind(hash).first();
+}
+
+async function findFilesByHashes(hashes, env) {
+    const unique = [...new Set((hashes || []).filter((h) => typeof h === 'string' && /^[a-f0-9]{64}$/i.test(h)))];
+    if (!unique.length) return {};
+    const placeholders = unique.map(() => '?').join(',');
+    const rows = await env.DB.prepare(
+        `SELECT hash, path, name FROM items WHERE type = "file" AND hash IN (${placeholders})`
+    ).bind(...unique).all();
+    const map = {};
+    for (const row of rows.results || []) {
+        if (row.hash) map[row.hash] = { path: row.path, name: row.name };
+    }
+    return map;
+}
+
+async function handleCheckHash(request, user, env, ctx) {
+    const { hashes } = await parseJsonBody(request);
+    if (!Array.isArray(hashes) || hashes.length === 0) {
+        return jsonResponse({ error: 'Missing hashes' }, 400);
+    }
+    if (hashes.length > 100) return jsonResponse({ error: 'Too many hashes (max 100)' }, 400);
+
+    const settings = await getSettings(env, ctx);
+    const origin = new URL(request.url).origin;
+    const found = await findFilesByHashes(hashes, env);
+    const matches = {};
+    for (const [hash, item] of Object.entries(found)) {
+        matches[hash] = {
+            path: item.path,
+            name: item.name,
+            url: buildPublicUrl(item.path, settings, origin)
+        };
+    }
+    return jsonResponse({ matches });
 }
 
 // ------------------- R2 同步 -------------------
@@ -1108,6 +1245,7 @@ async function handleUpload(request, user, env, ctx) {
                     duplicate: true,
                     message: '文件已存在',
                     url: buildPublicUrl(duplicate.path, settings, origin),
+                    path: duplicate.path,
                     existingPath: duplicate.path,
                     existingName: duplicate.name
                 });
@@ -1120,7 +1258,7 @@ async function handleUpload(request, user, env, ctx) {
             await env.DB.prepare(
                 'INSERT OR REPLACE INTO items (path, name, parent, type, size, mime, uploaded_by, uploaded_at, hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)'
             ).bind(key, file.name, targetDir, 'file', file.size, mime, user.id, Date.now(), hash).run();
-            results.push({ name: file.name, success: true, url: buildPublicUrl(key, settings, origin) });
+            results.push({ name: file.name, success: true, path: key, url: buildPublicUrl(key, settings, origin) });
         } catch (err) {
             results.push({ name: file.name, error: err.message });
         }

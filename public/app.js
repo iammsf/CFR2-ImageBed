@@ -19,6 +19,17 @@ const filesListSeq = new Map();
 let previewImageObserver = null;
 const FILES_CACHE_TTL = 60_000;
 let uploadInProgress = false;
+let searchQuery = '';
+let searchScope = 'local';
+let searchExt = '';
+let searchDateFrom = '';
+let searchDateTo = '';
+let searchResults = null;
+let searchTotal = 0;
+let searchOffset = 0;
+let searchLoading = false;
+let searchDebounceTimer = null;
+let searchRequestSeq = 0;
 
 // ------------------- UI 弹窗组件 -------------------
 const UI_ICON = { info: 'info', success: 'check_circle', error: 'error', warning: 'warning' };
@@ -679,13 +690,13 @@ function syncFooterSpacer() {
 
 function applySettings(settings) {
     if (!settings) return;
-    currentSettings = settings;
-    document.title = settings.site_title || '我的图床';
-    document.body.style.backgroundImage = settings.site_bg ? `url(${settings.site_bg})` : '';
+    currentSettings = { ...currentSettings, ...settings };
+    document.title = currentSettings.site_title || '我的图床';
+    document.body.style.backgroundImage = currentSettings.site_bg ? `url(${currentSettings.site_bg})` : '';
     const footer = document.getElementById('site-footer');
     if (footer) {
-        if (settings.footer_html) {
-            footer.innerHTML = `<div class="site-footer__content">${settings.footer_html}</div>`;
+        if (currentSettings.footer_html) {
+            footer.innerHTML = `<div class="site-footer__content">${currentSettings.footer_html}</div>`;
             footer.classList.remove('is-hidden');
         } else {
             footer.innerHTML = '';
@@ -992,20 +1003,62 @@ function renderGalleryPage(initialFiles = null, initialPath = null) {
             </div>
         </div>
         <div class="gallery-main">
-            <div class="sort-panel">
-                <div>排序方式：</div>
-                <select id="sort-field" class="sort-select">
-                    <option value="name">文件名</option>
-                    <option value="uploaded_at">时间</option>
-                    <option value="size">文件大小</option>
-                </select>
-                <select id="sort-direction" class="sort-select">
-                    <option value="asc">升序</option>
-                    <option value="desc">降序</option>
-                </select>
+            <div class="sort-panel" id="sort-search-panel">
+                <div class="sort-panel__main">
+                    <div class="sort-panel__left">
+                        <div class="sort-panel__label">排序方式：</div>
+                        <select id="sort-field" class="sort-select">
+                            <option value="name">文件名</option>
+                            <option value="uploaded_at">时间</option>
+                            <option value="size">文件大小</option>
+                        </select>
+                        <select id="sort-direction" class="sort-select">
+                            <option value="asc">升序</option>
+                            <option value="desc">降序</option>
+                        </select>
+                    </div>
+                    ${canView ? `<div class="sort-panel__right">
+                        <div class="search-bar" id="search-panel">
+                            <span class="icon search-bar__icon">search</span>
+                            <input type="search" id="gallery-search" class="search-input" placeholder="搜索文件名…" autocomplete="off" enterkeyhint="search">
+                            <button type="button" id="search-clear" class="search-clear is-hidden" aria-label="清除搜索"><span class="icon">close</span></button>
+                        </div>
+                        <button type="button" class="btn btn-text search-filter-toggle" id="search-filter-toggle" aria-expanded="false" title="搜索筛选"><span class="icon">tune</span></button>
+                    </div>` : ''}
+                </div>
+                ${canView ? `<div class="search-filters is-collapsed" id="search-filters-row">
+                    <label class="search-filter">
+                        <span class="search-filter__label">范围</span>
+                        <select id="search-scope" class="sort-select search-select">
+                            <option value="local">当前目录</option>
+                            <option value="global">全局</option>
+                        </select>
+                    </label>
+                    <label class="search-filter">
+                        <span class="search-filter__label">类型</span>
+                        <select id="search-ext" class="sort-select search-select">
+                            <option value="">全部</option>
+                            <option value="jpg">JPG</option>
+                            <option value="png">PNG</option>
+                            <option value="gif">GIF</option>
+                            <option value="webp">WebP</option>
+                            <option value="svg">SVG</option>
+                            <option value="bmp">BMP</option>
+                            <option value="avif">AVIF</option>
+                        </select>
+                    </label>
+                    <label class="search-filter">
+                        <span class="search-filter__label">起</span>
+                        <input type="date" id="search-date-from" class="search-date">
+                    </label>
+                    <label class="search-filter">
+                        <span class="search-filter__label">止</span>
+                        <input type="date" id="search-date-to" class="search-date">
+                    </label>
+                </div>
+                <div id="search-status" class="search-status is-hidden" aria-live="polite"></div>` : ''}
             </div>
             <div class="file-grid" id="file-grid" style="min-height:300px;"></div>
-            <div id="upload-progress" class="upload-progress" style="display:none;"></div>
         </div>
         <div id="batch-bar" class="batch-bar is-hidden">
             <span class="batch-bar__count">已选 0 项</span>
@@ -1029,8 +1082,16 @@ function renderGalleryPage(initialFiles = null, initialPath = null) {
     const manageBtn = document.getElementById('manage-btn');
     if (manageBtn) manageBtn.onclick = () => renderManagePage();
     document.getElementById('logout-btn').onclick = async () => { await apiFetch(`${API_BASE}/logout`,{method:'POST'}); currentUser=null; clearAuthToken(); renderLoginPage(); };
-    document.getElementById('sort-field').onchange = (e) => { sortField = e.target.value; renderFileGrid(); };
-    document.getElementById('sort-direction').onchange = (e) => { sortDirection = e.target.value; renderFileGrid(); };
+    document.getElementById('sort-field').onchange = (e) => {
+        sortField = e.target.value;
+        if (searchScope === 'global' && searchQuery.trim()) runGlobalSearch(true);
+        else renderFileGrid();
+    };
+    document.getElementById('sort-direction').onchange = (e) => {
+        sortDirection = e.target.value;
+        renderFileGrid();
+    };
+    bindGallerySearch();
     bindBatchBarActions();
     bindGalleryContextMenu();
     window.addEventListener('click', hideContextMenu);
@@ -1334,14 +1395,57 @@ function getUploadProgressPanel() {
     return panel;
 }
 
+function initUploadQueuePanel(total) {
+    const panel = getUploadProgressPanel();
+    panel.innerHTML = `
+        <div class="upload-progress__header">
+            <span class="upload-progress__title">上传队列</span>
+            <span class="upload-progress__summary" id="upload-queue-summary">0 / ${total} 完成</span>
+        </div>
+        <div class="upload-progress__list"></div>
+    `;
+    panel.style.display = 'block';
+    return panel.querySelector('.upload-progress__list');
+}
+
+function updateUploadQueueSummary(done, total) {
+    const el = document.getElementById('upload-queue-summary');
+    if (el) el.textContent = `${done} / ${total} 完成`;
+}
+
 function hideUploadProgressIfEmpty() {
     const panel = document.getElementById('upload-progress');
     const list = panel?.querySelector('.upload-progress__list');
-    if (panel && list && !list.children.length) panel.style.display = 'none';
+    if (panel && list && !list.children.length) {
+        panel.style.display = 'none';
+        panel.innerHTML = '';
+    }
+}
+
+function getUploadDismissMs(kind) {
+    const key = kind === 'error' ? 'upload_error_dismiss_sec' : 'upload_success_dismiss_sec';
+    const fallback = kind === 'error' ? 5 : 3;
+    const sec = Number(currentSettings[key] ?? fallback);
+    if (!Number.isFinite(sec)) return fallback * 1000;
+    return Math.min(Math.max(sec, 1), 300) * 1000;
+}
+
+function isUploadPreviewableFile(file) {
+    if (!file) return false;
+    if (file.type && file.type.startsWith('image/')) return true;
+    return IMAGE_EXT_RE.test(file.name || '');
+}
+
+function releaseUploadRowResources(rowEl) {
+    if (rowEl?._thumbUrl) {
+        URL.revokeObjectURL(rowEl._thumbUrl);
+        delete rowEl._thumbUrl;
+    }
 }
 
 function removeUploadRow(rowEl) {
     if (!rowEl) return;
+    releaseUploadRowResources(rowEl);
     rowEl.classList.add('is-leaving');
     setTimeout(() => {
         rowEl.remove();
@@ -1349,42 +1453,68 @@ function removeUploadRow(rowEl) {
     }, 280);
 }
 
-function createUploadRow(file, rowId) {
-    const panel = getUploadProgressPanel();
-    let list = panel.querySelector('.upload-progress__list');
-    if (!list) {
-        panel.innerHTML = '<div class="upload-progress__list"></div>';
-        list = panel.querySelector('.upload-progress__list');
+function bindUploadRowThumb(ui, file) {
+    const thumb = ui.thumbEl;
+    if (!thumb) return;
+    if (isUploadPreviewableFile(file)) {
+        const url = URL.createObjectURL(file);
+        ui.row._thumbUrl = url;
+        const img = document.createElement('img');
+        img.src = url;
+        img.alt = '';
+        img.decoding = 'async';
+        thumb.appendChild(img);
+        return;
     }
-    panel.style.display = 'block';
+    thumb.innerHTML = '<span class="icon">insert_drive_file</span>';
+}
+
+function createUploadRow(file, rowId, listEl) {
+    const list = listEl || getUploadProgressPanel().querySelector('.upload-progress__list');
+    if (!list) return null;
 
     const row = document.createElement('div');
-    row.className = 'upload-file-row';
+    row.className = 'upload-file-row is-pending';
     row.dataset.rowId = rowId;
     row.innerHTML = `
-        <div class="upload-file-row__main">
-            <div class="upload-file-row__name" title="${escapeHtml(file.name)}">${escapeHtml(file.name)}</div>
-            <div class="upload-file-row__stats">0% · 0 B / ${escapeHtml(formatFileSize(file.size))}</div>
-        </div>
-        <div class="upload-file-row__track">
-            <div class="upload-file-row__bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
-                <div class="upload-file-row__fill"></div>
+        <div class="upload-file-row__layout">
+            <div class="upload-file-row__thumb" aria-hidden="true"></div>
+            <div class="upload-file-row__content">
+                <div class="upload-file-row__main">
+                    <div class="upload-file-row__name" title="${escapeHtml(file.name)}">${escapeHtml(file.name)}</div>
+                    <div class="upload-file-row__stats">等待中</div>
+                </div>
+                <div class="upload-file-row__track">
+                    <div class="upload-file-row__bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+                        <div class="upload-file-row__fill"></div>
+                    </div>
+                    <button type="button" class="upload-file-row__copy btn btn-text" hidden>
+                        <span class="icon">content_copy</span> 复制链接
+                    </button>
+                </div>
             </div>
-            <button type="button" class="upload-file-row__copy btn btn-text" hidden>
-                <span class="icon">content_copy</span> 复制链接
-            </button>
         </div>
     `;
     list.appendChild(row);
 
-    return {
+    const ui = {
         row,
+        thumbEl: row.querySelector('.upload-file-row__thumb'),
         nameEl: row.querySelector('.upload-file-row__name'),
         statsEl: row.querySelector('.upload-file-row__stats'),
         barEl: row.querySelector('.upload-file-row__bar'),
         fillEl: row.querySelector('.upload-file-row__fill'),
         copyBtn: row.querySelector('.upload-file-row__copy')
     };
+    bindUploadRowThumb(ui, file);
+    return ui;
+}
+
+function setUploadRowStatus(ui, statusText, className) {
+    if (!ui?.row) return;
+    ui.row.classList.remove('is-pending', 'is-hashing', 'is-uploading');
+    if (className) ui.row.classList.add(className);
+    if (ui.statsEl) ui.statsEl.textContent = statusText;
 }
 
 function updateUploadRow(ui, loaded, total) {
@@ -1395,13 +1525,14 @@ function updateUploadRow(ui, loaded, total) {
 }
 
 function markUploadRowDone(ui, publicUrl, options = {}) {
+    ui.row.classList.remove('is-pending', 'is-hashing', 'is-uploading');
     ui.row.classList.add('is-done');
     if (options.duplicate) ui.row.classList.add('is-duplicate');
     updateUploadRow(ui, ui.row._fileSize || 1, ui.row._fileSize || 1);
     if (ui.statsEl) {
-        ui.statsEl.textContent = options.message || `100% · ${formatFileSize(ui.row._fileSize || 0)} / ${formatFileSize(ui.row._fileSize || 0)}`;
+        ui.statsEl.textContent = options.message || (options.duplicate ? '文件已存在' : '上传完成');
     }
-    if (ui.copyBtn) {
+    if (ui.copyBtn && publicUrl) {
         ui.copyBtn.hidden = false;
         ui.copyBtn.onclick = async (e) => {
             e.stopPropagation();
@@ -1413,15 +1544,94 @@ function markUploadRowDone(ui, publicUrl, options = {}) {
             }
         };
     }
-    setTimeout(() => removeUploadRow(ui.row), 3000);
+    setTimeout(() => removeUploadRow(ui.row), getUploadDismissMs('success'));
 }
 
 function markUploadRowError(ui, message) {
+    ui.row.classList.remove('is-pending', 'is-hashing', 'is-uploading');
     ui.row.classList.add('is-error');
     if (ui.statsEl) ui.statsEl.textContent = message || '上传失败';
     if (ui.fillEl) ui.fillEl.style.width = '100%';
     ui.row.querySelector('.upload-file-row__bar')?.classList.add('is-error');
-    setTimeout(() => removeUploadRow(ui.row), 5000);
+    setTimeout(() => removeUploadRow(ui.row), getUploadDismissMs('error'));
+}
+
+async function sha256HexFromFile(file) {
+    const buffer = await file.arrayBuffer();
+    const digest = await crypto.subtle.digest('SHA-256', buffer);
+    return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function checkFileHashes(hashes) {
+    const unique = [...new Set((hashes || []).filter(Boolean))];
+    if (!unique.length) return {};
+    const res = await apiFetch(`${API_BASE}/check-hash`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ hashes: unique })
+    });
+    if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.error || 'Hash 校验失败');
+    }
+    const data = await res.json();
+    return data.matches || {};
+}
+
+function createUploadHashChecker() {
+    const duplicateMap = {};
+    const pending = new Set();
+    const checked = new Set();
+    let chain = Promise.resolve();
+    let warned = false;
+
+    const flush = () => {
+        if (!pending.size) return chain;
+        const batch = [...pending];
+        batch.forEach((h) => pending.delete(h));
+        chain = chain.then(async () => {
+            try {
+                Object.assign(duplicateMap, await checkFileHashes(batch));
+            } catch (err) {
+                if (!warned) {
+                    warned = true;
+                    uiToast(err.message || 'Hash 校验失败，将直接上传', 'warning');
+                }
+            }
+        });
+        return chain;
+    };
+
+    return {
+        duplicateMap,
+        noteHash(hash) {
+            if (!hash || checked.has(hash)) return flush();
+            checked.add(hash);
+            pending.add(hash);
+            return flush();
+        },
+        waitReady() {
+            return chain;
+        }
+    };
+}
+
+function startUploadFileHash(item, hashChecker) {
+    if (!item.ui) {
+        item.hashPromise = Promise.resolve(null);
+        return;
+    }
+    item.hashPromise = (async () => {
+        setUploadRowStatus(item.ui, '校验中…', 'is-hashing');
+        try {
+            const hash = await sha256HexFromFile(item.file);
+            if (hash) hashChecker.noteHash(hash);
+            return hash;
+        } catch {
+            item.hashError = true;
+            return null;
+        }
+    })();
 }
 
 function uploadSingleFileWithProgress(file, targetDir, onProgress) {
@@ -1468,34 +1678,84 @@ async function uploadFiles(files) {
 
     uploadInProgress = true;
     const targetDir = normalizeCurrentPath(currentPath);
-    let anyNewUpload = false;
+    const total = normalized.length;
+    let doneCount = 0;
+
+    const listEl = initUploadQueuePanel(total);
+    const queue = normalized.map((file, index) => {
+        const rowId = `${Date.now()}-${index}-${Math.random().toString(36).slice(2, 7)}`;
+        const ui = createUploadRow(file, rowId, listEl);
+        if (ui) ui.row._fileSize = file.size;
+        return { file, ui };
+    });
+
+    const bumpDone = () => {
+        doneCount++;
+        updateUploadQueueSummary(doneCount, total);
+    };
+
+    const hashChecker = createUploadHashChecker();
+    let searchCleared = false;
+
+    const afterUploadSuccess = async (isNewFile) => {
+        if (!searchCleared) {
+            exitSearchAndShowDirectory();
+            searchCleared = true;
+        }
+        if (isNewFile) {
+            invalidateFilesListCache();
+            await loadFiles(targetDir, { force: true });
+        }
+    };
+
+    queue.forEach((item) => startUploadFileHash(item, hashChecker));
 
     try {
-        for (let index = 0; index < normalized.length; index++) {
-            const file = normalized[index];
-            const rowId = `${Date.now()}-${index}-${Math.random().toString(36).slice(2, 7)}`;
-            const ui = createUploadRow(file, rowId);
-            ui.row._fileSize = file.size;
+        for (const item of queue) {
+            const { file, ui } = item;
+            if (!ui) continue;
+
+            const hash = await item.hashPromise;
+            await hashChecker.waitReady();
+
+            if (item.hashError) {
+                markUploadRowError(ui, '校验失败');
+                bumpDone();
+                continue;
+            }
+
+            const duplicate = hash ? hashChecker.duplicateMap[hash] : null;
+            if (duplicate) {
+                markUploadRowDone(ui, duplicate.url, {
+                    duplicate: true,
+                    message: `已存在 · ${duplicate.name}`
+                });
+                await afterUploadSuccess(false);
+                bumpDone();
+                continue;
+            }
+
+            setUploadRowStatus(ui, `0% · 0 B / ${formatFileSize(file.size)}`, 'is-uploading');
             try {
-                const result = await uploadSingleFileWithProgress(file, targetDir, (loaded, total) => {
-                    updateUploadRow(ui, loaded, total);
+                const result = await uploadSingleFileWithProgress(file, targetDir, (loaded, totalBytes) => {
+                    updateUploadRow(ui, loaded, totalBytes);
                 });
                 updateUploadRow(ui, file.size, file.size);
                 if (result.duplicate) {
                     markUploadRowDone(ui, result.url, { duplicate: true, message: result.message || '文件已存在' });
+                    await afterUploadSuccess(false);
                 } else {
-                    markUploadRowDone(ui, result.url);
-                    anyNewUpload = true;
+                    markUploadRowDone(ui, result.url, { message: '上传完成' });
+                    await afterUploadSuccess(true);
                 }
             } catch (err) {
                 markUploadRowError(ui, err.message || '上传失败');
             }
+            bumpDone();
         }
     } finally {
         uploadInProgress = false;
     }
-
-    if (anyNewUpload) await refreshGalleryAfterMutation();
 }
 
 function invalidateFilesListCache() {
@@ -1840,33 +2100,378 @@ function sortItems(items) {
     });
 }
 
+function isSearchActive() {
+    return !!(searchQuery.trim() || searchExt || searchDateFrom || searchDateTo);
+}
+
+function dateInputToStartTs(dateStr) {
+    if (!dateStr) return 0;
+    const d = new Date(`${dateStr}T00:00:00`);
+    const ts = d.getTime();
+    return Number.isFinite(ts) ? Math.floor(ts / 1000) : 0;
+}
+
+function dateInputToEndTs(dateStr) {
+    if (!dateStr) return 0;
+    const d = new Date(`${dateStr}T23:59:59`);
+    const ts = d.getTime();
+    return Number.isFinite(ts) ? Math.floor(ts / 1000) : 0;
+}
+
+function itemMatchesExtFilter(item, ext) {
+    if (!ext || item.type !== 'file') return true;
+    const name = (item.name || item.path || '').toLowerCase();
+    const normalized = ext.toLowerCase().replace(/^\./, '');
+    const suffixes = normalized === 'jpg' || normalized === 'jpeg'
+        ? ['.jpg', '.jpeg']
+        : [`.${normalized}`];
+    return suffixes.some((suffix) => name.endsWith(suffix));
+}
+
+function itemMatchesDateFilter(item) {
+    const ts = item.uploaded_at || 0;
+    const fromTs = dateInputToStartTs(searchDateFrom);
+    const toTs = dateInputToEndTs(searchDateTo);
+    if (fromTs && ts < fromTs) return false;
+    if (toTs && ts > toTs) return false;
+    return true;
+}
+
+function applyLocalSearchFilters(items) {
+    const q = searchQuery.trim().toLowerCase();
+    if (!q && !searchExt && !searchDateFrom && !searchDateTo) return items;
+    return items.filter((item) => {
+        if (searchExt && item.type !== 'file') return false;
+        if (q && !(item.name || '').toLowerCase().includes(q)) return false;
+        if (!itemMatchesExtFilter(item, searchExt)) return false;
+        if (!itemMatchesDateFilter(item)) return false;
+        return true;
+    });
+}
+
+function getDisplayFileList() {
+    if (searchScope === 'global' && searchQuery.trim()) {
+        return searchResults || [];
+    }
+    return applyLocalSearchFilters(fileList);
+}
+
+function formatSearchItemPath(item) {
+    const parent = getItemParentPath(item.path, item.type);
+    if (!parent || parent === '/') return '/';
+    return parent;
+}
+
+function updateSearchStatus() {
+    const el = document.getElementById('search-status');
+    if (!el) return;
+    const q = searchQuery.trim();
+    if (!isSearchActive()) {
+        el.classList.add('is-hidden');
+        el.textContent = '';
+        return;
+    }
+    el.classList.remove('is-hidden');
+    if (searchScope === 'global') {
+        if (searchLoading) {
+            el.textContent = '正在搜索…';
+            return;
+        }
+        if (!q) {
+            el.textContent = '请输入关键词进行全局搜索';
+            return;
+        }
+        const loaded = searchResults?.length || 0;
+        el.textContent = loaded
+            ? `全局搜索「${q}」：已显示 ${loaded} / ${searchTotal} 条`
+            : `全局搜索「${q}」：无匹配结果`;
+        return;
+    }
+    const count = getDisplayFileList().length;
+    el.textContent = count
+        ? `当前目录：${count} 条匹配`
+        : '当前目录：无匹配结果';
+}
+
+function syncSearchClearButton() {
+    const btn = document.getElementById('search-clear');
+    if (!btn) return;
+    btn.classList.toggle('is-hidden', !isSearchActive());
+}
+
+function resetSearchState() {
+    searchQuery = '';
+    searchScope = 'local';
+    searchExt = '';
+    searchDateFrom = '';
+    searchDateTo = '';
+    searchResults = null;
+    searchTotal = 0;
+    searchOffset = 0;
+    searchLoading = false;
+    if (searchDebounceTimer) {
+        clearTimeout(searchDebounceTimer);
+        searchDebounceTimer = null;
+    }
+}
+
+function syncSearchInputsFromState() {
+    const input = document.getElementById('gallery-search');
+    const scopeEl = document.getElementById('search-scope');
+    const extEl = document.getElementById('search-ext');
+    const fromEl = document.getElementById('search-date-from');
+    const toEl = document.getElementById('search-date-to');
+    const filtersRow = document.getElementById('search-filters-row');
+    const filterToggle = document.getElementById('search-filter-toggle');
+    if (input) input.value = searchQuery;
+    if (scopeEl) scopeEl.value = searchScope;
+    if (extEl) extEl.value = searchExt;
+    if (fromEl) fromEl.value = searchDateFrom;
+    if (toEl) toEl.value = searchDateTo;
+    if (filtersRow) filtersRow.classList.add('is-collapsed');
+    if (filterToggle) {
+        filterToggle.setAttribute('aria-expanded', 'false');
+        filterToggle.classList.remove('is-active');
+    }
+    syncSearchClearButton();
+    updateSearchStatus();
+}
+
+function exitSearchAndShowDirectory() {
+    if (!isSearchActive() && !(searchScope === 'global' && searchQuery.trim())) return false;
+    resetSearchState();
+    syncSearchInputsFromState();
+    return true;
+}
+
+function scheduleGlobalSearch(resetOffset = true) {
+    if (searchDebounceTimer) clearTimeout(searchDebounceTimer);
+    searchDebounceTimer = setTimeout(() => {
+        searchDebounceTimer = null;
+        runGlobalSearch(resetOffset);
+    }, 350);
+}
+
+async function runGlobalSearch(resetOffset = true) {
+    if (searchScope !== 'global') return;
+    const q = searchQuery.trim();
+    if (!q) {
+        searchResults = null;
+        searchTotal = 0;
+        searchOffset = 0;
+        searchLoading = false;
+        updateSearchStatus();
+        renderFileGrid();
+        return;
+    }
+    if (resetOffset) searchOffset = 0;
+    const seq = ++searchRequestSeq;
+    searchLoading = true;
+    updateSearchStatus();
+
+    const params = new URLSearchParams({
+        q,
+        limit: '50',
+        offset: String(searchOffset),
+        sort: sortField === 'name' ? 'name' : sortField === 'size' ? 'size' : 'uploaded_at'
+    });
+    if (searchExt) params.set('ext', searchExt);
+    const fromTs = dateInputToStartTs(searchDateFrom);
+    const toTs = dateInputToEndTs(searchDateTo);
+    if (fromTs) params.set('from', String(fromTs));
+    if (toTs) params.set('to', String(toTs));
+
+    try {
+        const res = await apiFetch(`${API_BASE}/search?${params}`);
+        if (seq !== searchRequestSeq) return;
+        if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            uiToast(err.error || '搜索失败', 'error');
+            searchResults = [];
+            searchTotal = 0;
+            return;
+        }
+        const data = await res.json();
+        const items = Array.isArray(data.items) ? data.items : [];
+        if (resetOffset || !searchResults) searchResults = items;
+        else searchResults = searchResults.concat(items);
+        searchTotal = Number(data.total) || items.length;
+    } catch {
+        if (seq === searchRequestSeq) {
+            uiToast('搜索失败', 'error');
+            searchResults = [];
+            searchTotal = 0;
+        }
+    } finally {
+        if (seq === searchRequestSeq) {
+            searchLoading = false;
+            updateSearchStatus();
+            renderFileGrid();
+        }
+    }
+}
+
+function onSearchInputChange() {
+    syncSearchClearButton();
+    if (searchScope === 'global') {
+        scheduleGlobalSearch(true);
+        return;
+    }
+    searchResults = null;
+    searchTotal = 0;
+    updateSearchStatus();
+    renderFileGrid();
+}
+
+function focusGallerySearch() {
+    const panel = document.getElementById('search-panel');
+    const input = document.getElementById('gallery-search');
+    if (!panel || !input) return;
+    panel.classList.add('search-bar--highlight');
+    setTimeout(() => panel.classList.remove('search-bar--highlight'), 1200);
+    input.focus({ preventScroll: true });
+    input.select();
+}
+
+function bindGallerySearch() {
+    const input = document.getElementById('gallery-search');
+    const clearBtn = document.getElementById('search-clear');
+    const filterToggle = document.getElementById('search-filter-toggle');
+    const filtersRow = document.getElementById('search-filters-row');
+    const scopeEl = document.getElementById('search-scope');
+    const extEl = document.getElementById('search-ext');
+    const fromEl = document.getElementById('search-date-from');
+    const toEl = document.getElementById('search-date-to');
+    if (!input) return;
+
+    input.value = searchQuery;
+    scopeEl.value = searchScope;
+    extEl.value = searchExt;
+    fromEl.value = searchDateFrom;
+    toEl.value = searchDateTo;
+    syncSearchClearButton();
+    updateSearchStatus();
+
+    input.addEventListener('input', () => {
+        searchQuery = input.value;
+        onSearchInputChange();
+    });
+    input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+            e.preventDefault();
+            if (searchScope === 'global') {
+                if (searchDebounceTimer) {
+                    clearTimeout(searchDebounceTimer);
+                    searchDebounceTimer = null;
+                }
+                runGlobalSearch(true);
+            }
+        }
+    });
+    clearBtn?.addEventListener('click', () => {
+        resetSearchState();
+        syncSearchInputsFromState();
+        renderFileGrid();
+    });
+    scopeEl.addEventListener('change', () => {
+        searchScope = scopeEl.value;
+        searchResults = null;
+        searchTotal = 0;
+        searchOffset = 0;
+        onSearchInputChange();
+    });
+    extEl.addEventListener('change', () => {
+        searchExt = extEl.value;
+        onSearchInputChange();
+    });
+    fromEl.addEventListener('change', () => {
+        searchDateFrom = fromEl.value;
+        onSearchInputChange();
+    });
+    toEl.addEventListener('change', () => {
+        searchDateTo = toEl.value;
+        onSearchInputChange();
+    });
+    filterToggle?.addEventListener('click', () => {
+        const collapsed = filtersRow?.classList.toggle('is-collapsed');
+        const expanded = collapsed === false;
+        filterToggle.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+        filterToggle.classList.toggle('is-active', expanded);
+    });
+}
+
+async function openSearchResultItem(item) {
+    if (!item?.path) return;
+    if (item.type === 'dir') {
+        await loadFiles(item.path);
+        return;
+    }
+    const parent = getItemParentPath(item.path, item.type);
+    await loadFiles(parent);
+    showImageViewer(item.path);
+}
+
+function bindSearchLoadMore() {
+    const btn = document.getElementById('search-load-more');
+    if (!btn || btn.dataset.bound) return;
+    btn.dataset.bound = '1';
+    btn.addEventListener('click', async () => {
+        searchOffset = searchResults?.length || 0;
+        await runGlobalSearch(false);
+    });
+}
+
 function renderFileGrid() {
     const grid = document.getElementById('file-grid');
     if (!grid) return;
-    const items = sortItems(fileList);
+    const isGlobalSearch = searchScope === 'global' && searchQuery.trim();
+    const items = sortItems(getDisplayFileList());
+    const showPathHint = isGlobalSearch;
+    if (searchLoading && isGlobalSearch && items.length === 0) {
+        grid.innerHTML = '<div class="file-grid-empty" style="grid-column:1/-1; text-align:center; padding:40px;">搜索中…</div>';
+        updateSearchStatus();
+        return;
+    }
     if (items.length===0) {
-        grid.innerHTML='<div class="file-grid-empty" style="grid-column:1/-1; text-align:center; padding:40px;">空文件夹</div>';
+        const emptyText = isSearchActive()
+            ? (isGlobalSearch ? '未找到匹配的文件' : '当前目录无匹配项')
+            : '空文件夹';
+        grid.innerHTML = `<div class="file-grid-empty" style="grid-column:1/-1; text-align:center; padding:40px;">${emptyText}</div>`;
+        updateSearchStatus();
         return;
     }
     const canUpload = hasUploadPerm();
     grid.innerHTML = items.map(item => {
         const selected = batchSelected.has(item.path);
+        const pathHint = showPathHint
+            ? `<div class="file-path-hint" title="${escapeHtml(formatSearchItemPath(item))}">${escapeHtml(formatSearchItemPath(item))}</div>`
+            : '';
         return `
         <div class="file-card${batchMode ? ' file-card--batch' : ''}${selected ? ' is-batch-selected' : ''}" data-path="${escapeHtml(item.path || '')}" data-type="${item.type}">
-            ${!batchMode && (canUpload || item.type === 'file') ? `<button class="file-card-menu" type="button" aria-label="更多操作" data-path="${escapeHtml(item.path || '')}" data-type="${item.type}">
+            ${!batchMode && !isGlobalSearch && (canUpload || item.type === 'file') ? `<button class="file-card-menu" type="button" aria-label="更多操作" data-path="${escapeHtml(item.path || '')}" data-type="${item.type}">
                 <span class="icon">more_vert</span>
             </button>` : ''}
             ${batchMode ? `<label class="file-card-check" aria-label="选择"><input type="checkbox"${selected ? ' checked' : ''}></label>` : ''}
             <div class="file-preview${isImageItem(item) ? ' file-preview--image' : ''}">${getPreviewHtml(item)}</div>
             <div class="file-name">${escapeHtml(item.name)}</div>
+            ${pathHint}
         </div>`;
-    }).join('');
+    }).join('') + (
+        isGlobalSearch && searchResults && searchResults.length < searchTotal
+            ? `<div class="search-load-more-wrap" style="grid-column:1/-1;"><button type="button" class="btn btn-outlined" id="search-load-more">加载更多（${searchResults.length}/${searchTotal}）</button></div>`
+            : ''
+    );
     initPreviewImages();
+    bindSearchLoadMore();
     document.querySelectorAll('.file-card').forEach(card=>{
         card.addEventListener('click',(e)=>{
             if (e.target.closest('.file-card-menu') || e.target.closest('.file-card-check')) return;
             e.stopPropagation();
             const path=card.dataset.path, type=card.dataset.type;
+            if (isGlobalSearch && type === 'file') {
+                openSearchResultItem(getFileListItem(path) || { path, type });
+                return;
+            }
             if (!batchMode && isDesktopGalleryInput() && (e.ctrlKey || e.metaKey || e.shiftKey)) {
                 enterBatchMode(path, type);
                 return;
@@ -1914,6 +2519,7 @@ function renderFileGrid() {
         });
     }
     updateBatchBar();
+    updateSearchStatus();
 }
 
 function bindBatchBarActions() {
@@ -2555,7 +3161,9 @@ function getFileListItem(path) {
 
 function findFileItem(path) {
     const key = (path || '').replace(/^\/+/, '');
-    return fileList.find(i => (i.path || '').replace(/^\/+/, '') === key);
+    const fromList = fileList.find(i => (i.path || '').replace(/^\/+/, '') === key);
+    if (fromList) return fromList;
+    return searchResults?.find(i => (i.path || '').replace(/^\/+/, '') === key) || null;
 }
 
 async function copyViewerText(text, label = '已复制') {
@@ -3095,6 +3703,8 @@ async function renderManagePage(){
                 <div class="form-group"><label>背景图URL</label><input type="text" id="site-bg" value="${settings.site_bg||''}" placeholder="请输入背景图地址"></div>
                 <div class="form-group"><label>页脚HTML</label><textarea id="footer-html" rows="4" placeholder="请输入页脚HTML内容">${settings.footer_html||''}</textarea></div>
                 <div class="form-group"><label>R2公开链接</label><input type="text" id="r2-public-url" value="${settings.r2_public_url||''}" placeholder="https://your-bucket.r2.dev"></div>
+                <div class="form-group"><label>上传成功提示（秒）</label><input type="number" id="upload-success-dismiss" min="1" max="300" value="${settings.upload_success_dismiss_sec ?? 3}" placeholder="3"><small style="display:block;margin-top:6px;color:var(--text-secondary);font-size:12px;">成功后显示复制链接的时间，保存后立即作用于图库页</small></div>
+                <div class="form-group"><label>上传失败提示（秒）</label><input type="number" id="upload-error-dismiss" min="1" max="300" value="${settings.upload_error_dismiss_sec ?? 5}" placeholder="5"><small style="display:block;margin-top:6px;color:var(--text-secondary);font-size:12px;">失败或校验失败时的提示停留时间</small></div>
                 <button class="btn btn-filled" id="save-settings">保存设置</button>
             </div>
 
@@ -3187,7 +3797,7 @@ async function renderManagePage(){
     document.getElementById('export-settings').onclick=()=>window.location.href=`${API_BASE}/settings/export`;
     document.getElementById('import-settings').onclick=()=>{ const inp=document.createElement('input'); inp.type='file'; inp.accept='application/json'; inp.onchange=async(e)=>{ const file=e.target.files[0]; if (!file) return; await runWithLoading('导入设置中，请稍候', async () => { try { const text=await file.text(); const json=JSON.parse(text); const res=await apiFetch(`${API_BASE}/settings/import`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(json)}); if (res.ok) { uiToast('导入成功', 'success'); await renderManagePage(); } else uiToast('导入失败', 'error'); } catch { uiToast('导入失败，文件格式无效', 'error'); } }); }; inp.click(); };
     document.getElementById('update-profile').onclick=async()=>{ const nickname=document.getElementById('profile-nickname').value; const password=document.getElementById('profile-password').value; const body={nickname}; if(password) body.password=password; await runWithLoading('更新资料中，请稍候', async () => { const res=await apiFetch(`${API_BASE}/user/profile`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}); if(res.ok){ const data=await res.json(); if(data.token) setAuthToken(data.token); if(data.user) currentUser=data.user; uiToast('更新成功', 'success'); await renderManagePage(); } else uiToast('更新失败', 'error'); }); };
-    document.getElementById('save-settings').onclick=async()=>{ const newSettings={ site_title:document.getElementById('site-title').value, site_logo:document.getElementById('site-logo').value, site_bg:document.getElementById('site-bg').value, footer_html:document.getElementById('footer-html').value, r2_public_url:document.getElementById('r2-public-url').value }; await runWithLoading('保存设置中，请稍候', async () => { const res=await apiFetch(`${API_BASE}/settings`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(newSettings)}); if (res.ok) { uiToast('设置已保存', 'success'); await loadSettings(); await renderManagePage(); } else uiToast('保存失败', 'error'); }); };
+    document.getElementById('save-settings').onclick=async()=>{ const newSettings={ site_title:document.getElementById('site-title').value, site_logo:document.getElementById('site-logo').value, site_bg:document.getElementById('site-bg').value, footer_html:document.getElementById('footer-html').value, r2_public_url:document.getElementById('r2-public-url').value, upload_success_dismiss_sec: parseInt(document.getElementById('upload-success-dismiss').value,10)||3, upload_error_dismiss_sec: parseInt(document.getElementById('upload-error-dismiss').value,10)||5 }; await runWithLoading('保存设置中，请稍候', async () => { const res=await apiFetch(`${API_BASE}/settings`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(newSettings)}); if (res.ok) { applySettings(newSettings); uiToast('设置已保存', 'success'); await renderManagePage(); } else uiToast('保存失败', 'error'); }); };
     document.getElementById('save-ban-settings').onclick=async()=>{ const newSettings={ login_ban_window_sec: parseInt(document.getElementById('login-ban-window').value,10)||900, login_ban_max_attempts: parseInt(document.getElementById('login-ban-max').value,10)||5, login_ban_duration_sec: parseInt(document.getElementById('login-ban-duration').value,10) }; await runWithLoading('保存防暴力设置中，请稍候', async () => { const res=await apiFetch(`${API_BASE}/settings`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(newSettings)}); if (res.ok) { uiToast('防暴力设置已保存', 'success'); await loadSettings(); await renderManagePage(); } else uiToast('保存失败', 'error'); }); };
 }
 

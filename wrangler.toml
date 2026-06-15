@@ -1,6 +1,11 @@
-name = "CFR2-ImageBed"
+name = "my-imgbed"
 main = "worker.js"
 compatibility_date = "2026-06-13"
+
+# 自定义域名（与 Dashboard 中 my-imgbed 的域名绑定保持一致）
+routes = [
+  { pattern = "tuchuang.masi.fan", custom_domain = true }
+]
 
 [assets]
 directory = "./public"
@@ -19,7 +24,7 @@ bucket_name = "images"
 [[d1_databases]]
 binding = "DB"
 database_name = "imgbed"
-database_id = "00000000-0000-0000-0000-000000000000"
+database_id = "4e12b7fc-9a28-48a5-89d2-0e9d1dea0dce"
 
 # 日志和观察
 [observability]

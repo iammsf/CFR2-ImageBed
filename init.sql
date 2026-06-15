@@ -75,3 +75,5 @@ VALUES
 INSERT OR IGNORE INTO settings (key, value) VALUES ('login_ban_window_sec', '{"value":900}');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('login_ban_max_attempts', '{"value":5}');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('login_ban_duration_sec', '{"value":3600}');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('upload_success_dismiss_sec', '{"value":3}');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('upload_error_dismiss_sec', '{"value":5}');
