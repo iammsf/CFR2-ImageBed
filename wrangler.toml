@@ -3,8 +3,10 @@ main = "worker.js"
 compatibility_date = "2026-06-13"
 
 # 自定义域名（与 Dashboard 中 my-imgbed 的域名绑定保持一致）
+# tuchuang 主域名走 CF 橙云兜底；hf 为优选 IP 域名（DNS 灰云 A 记录直连优选入口，普通路由绑定）
 routes = [
-  { pattern = "tuchuang.masi.fan", custom_domain = true }
+  { pattern = "tuchuang.masi.fan", custom_domain = true },
+  { pattern = "hf.masi.fan/*", zone_name = "masi.fan" }
 ]
 
 [assets]
