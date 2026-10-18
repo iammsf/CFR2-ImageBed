@@ -17,6 +17,7 @@ const filesListCache = new Map();
 const filesListInflight = new Map();
 const filesListSeq = new Map();
 let previewImageObserver = null;
+let gridRenderSeq = 0;
 const FILES_CACHE_TTL = 60_000;
 let uploadInProgress = false;
 let searchQuery = '';
@@ -577,10 +578,27 @@ document.addEventListener('DOMContentLoaded', async () => {
 });
 
 // ------------------- 安装/登录/初始化 -------------------
+const INSTALL_CHECK_CACHE_KEY = 'imgbed_install_check';
+
 async function checkInstallAndRender() {
-    const res = await apiFetch(`${API_BASE}/install-check`);
-    const data = await res.json();
-    if (data.needInstall) {
+    // install-check 结果缓存到本地，省一次串行往返（首次打开页面的关键延迟）
+    let installState = null;
+    try { installState = JSON.parse(localStorage.getItem(INSTALL_CHECK_CACHE_KEY) || 'null'); } catch { /* ignore */ }
+    if (!installState || Date.now() - installState.ts > 6 * 3600_000) {
+        try {
+            const res = await apiFetch(`${API_BASE}/install-check`);
+            const data = await res.json();
+            installState = { needInstall: !!data.needInstall, ts: Date.now() };
+            if (!installState.needInstall) {
+                try { localStorage.setItem(INSTALL_CHECK_CACHE_KEY, JSON.stringify(installState)); } catch { /* ignore */ }
+            } else {
+                try { localStorage.removeItem(INSTALL_CHECK_CACHE_KEY); } catch { /* ignore */ }
+            }
+        } catch {
+            installState = { needInstall: false, ts: Date.now() }; // 网络异常时继续走 bootstrap，由它报错
+        }
+    }
+    if (installState.needInstall) {
         renderInstallPage();
         return;
     }
@@ -693,6 +711,19 @@ function applySettings(settings) {
     currentSettings = { ...currentSettings, ...settings };
     document.title = currentSettings.site_title || '我的图床';
     document.body.style.backgroundImage = currentSettings.site_bg ? `url(${currentSettings.site_bg})` : '';
+    // 提前与 R2 公链域名建连，缩略图/原图首包更快
+    if (currentSettings.r2_public_url) {
+        try {
+            const origin = new URL(currentSettings.r2_public_url, location.href).origin;
+            if (origin !== location.origin && !document.head.querySelector(`link[rel="preconnect"][href="${origin}"]`)) {
+                const link = document.createElement('link');
+                link.rel = 'preconnect';
+                link.href = origin;
+                link.crossOrigin = '';
+                document.head.appendChild(link);
+            }
+        } catch { /* ignore */ }
+    }
     const footer = document.getElementById('site-footer');
     if (footer) {
         if (currentSettings.footer_html) {
@@ -1854,7 +1885,10 @@ async function loadFiles(path, { force = false } = {}) {
     const promise = (async () => {
         try {
             const qs = new URLSearchParams({ parent: cacheKey });
-            if (force) qs.set('_', String(Date.now()));
+            if (force) {
+                qs.set('_', String(Date.now()));
+                qs.set('fresh', '1'); // 让 Worker 跳过列表的边缘缓存
+            }
             const res = await apiFetch(`${API_BASE}/files?${qs}`);
             if (!res.ok) throw new Error('load failed');
             const data = await res.json();
@@ -1979,6 +2013,27 @@ function revealPreviewImage(img, loader) {
     }
 }
 
+const IMG_TRANSFORM_STATE_KEY = 'imgbed_img_transform_ok';
+const THUMB_WIDTH = 480; // 网格缩略图宽度，配合 /cdn-cgi/image 大幅减小体积
+
+function imgTransformDisabled() {
+    try { return sessionStorage.getItem(IMG_TRANSFORM_STATE_KEY) === '0'; } catch { return false; }
+}
+
+function disableImgTransform() {
+    try { sessionStorage.setItem(IMG_TRANSFORM_STATE_KEY, '0'); } catch { /* ignore */ }
+}
+
+/** 缩略图优先走 Cloudflare Image Transformations（需在 Dashboard 开启），返回 '' 表示直接用原图 */
+function getThumbUrl(item) {
+    const path = (item?.path || '').replace(/^\/+/, '');
+    if (path && !imgTransformDisabled() && !/\.(svg|gif)$/i.test(path)) {
+        // svg/gif 无需转换；转换失败时由 onerror 降级为原图
+        return `/cdn-cgi/image/width=${THUMB_WIDTH},quality=75,format=auto/${path.split('/').map(encodeURIComponent).join('/')}`;
+    }
+    return getItemUrl(item);
+}
+
 function loadPreviewImage(img) {
     const preview = img.closest('.file-preview');
     const loader = preview?.querySelector('.preview-loader');
@@ -1990,6 +2045,10 @@ function loadPreviewImage(img) {
     const isSvg = img.classList.contains('is-svg');
     const imgUrl = src;
     let svgFallbackDone = false;
+    // 缩略图先尝试 /cdn-cgi/image 小图；失败（如未开启 Image Transformations）降级原图并记住
+    const card = img.closest('.file-card');
+    const thumbUrl = card ? getThumbUrl({ path: card.dataset.path }) : '';
+    let usingThumb = !!thumbUrl;
 
     const showBrokenIcon = () => {
         if (loader) loader.remove();
@@ -2026,6 +2085,12 @@ function loadPreviewImage(img) {
     };
 
     const showError = () => {
+        if (usingThumb) {
+            usingThumb = false;
+            disableImgTransform();
+            img.src = imgUrl;
+            return;
+        }
         if (isSvg) fetchSvgInline();
         else showBrokenIcon();
     };
@@ -2039,15 +2104,15 @@ function loadPreviewImage(img) {
         }
     };
 
-    img.onerror = isSvg ? showError : showBrokenIcon;
+    img.onerror = showError;
     img.onload = reveal;
-    img.src = imgUrl;
+    img.src = usingThumb ? thumbUrl : imgUrl;
 
     if (img.complete) {
         if (img.naturalWidth + img.naturalHeight > 0) {
             reveal();
-        } else if (!isSvg) {
-            showBrokenIcon();
+        } else if (!isSvg || !usingThumb) {
+            showError();
         }
     }
 
@@ -2069,7 +2134,7 @@ function initPreviewImages() {
             previewImageObserver.unobserve(entry.target);
             loadPreviewImage(entry.target);
         });
-    }, { root: null, rootMargin: '280px 0px', threshold: 0.01 });
+    }, { root: null, rootMargin: '600px 0px', threshold: 0.01 });
 
     document.querySelectorAll('.file-preview--image .preview-img[data-src]').forEach((img) => {
         previewImageObserver.observe(img);
@@ -2421,6 +2486,104 @@ function bindSearchLoadMore() {
     });
 }
 
+const GRID_CHUNK_SIZE = 60; // 分块渲染：可见缩略图无需等全部卡片建完
+
+function buildFileCardHtml(item, { batchMode: inBatch, showPathHint, canUpload }) {
+    const selected = batchSelected.has(item.path);
+    const pathHint = showPathHint
+        ? `<div class="file-path-hint" title="${escapeHtml(formatSearchItemPath(item))}">${escapeHtml(formatSearchItemPath(item))}</div>`
+        : '';
+    return `
+        <div class="file-card${inBatch ? ' file-card--batch' : ''}${selected ? ' is-batch-selected' : ''}" data-path="${escapeHtml(item.path || '')}" data-type="${item.type}">
+            ${!inBatch && !showPathHint && (canUpload || item.type === 'file') ? `<button class="file-card-menu" type="button" aria-label="更多操作" data-path="${escapeHtml(item.path || '')}" data-type="${item.type}">
+                <span class="icon">more_vert</span>
+            </button>` : ''}
+            ${inBatch ? `<label class="file-card-check" aria-label="选择"><input type="checkbox"${selected ? ' checked' : ''}></label>` : ''}
+            <div class="file-preview${isImageItem(item) ? ' file-preview--image' : ''}">${getPreviewHtml(item)}</div>
+            <div class="file-name">${escapeHtml(item.name)}</div>
+            ${pathHint}
+        </div>`;
+}
+
+function bindGridGestures(grid) {
+    if (grid.dataset.gesturesBound === '1') return;
+    grid.dataset.gesturesBound = '1';
+
+    grid.addEventListener('click', (e) => {
+        const menuBtn = e.target.closest('.file-card-menu');
+        if (menuBtn) {
+            e.stopPropagation();
+            selectedItem = getFileListItem(menuBtn.dataset.path) || { path: menuBtn.dataset.path, type: menuBtn.dataset.type };
+            const rect = menuBtn.getBoundingClientRect();
+            showContextMenu(rect.left, rect.bottom + 4, menuBtn.dataset.type);
+            return;
+        }
+        const card = e.target.closest('.file-card');
+        if (!card) return;
+        const isGlobalSearch = searchScope === 'global' && searchQuery.trim();
+        if (e.target.closest('.file-card-check')) {
+            e.stopPropagation();
+            const path = card.dataset.path;
+            const type = card.dataset.type;
+            toggleBatchSelection(path, type);
+            card.classList.toggle('is-batch-selected', batchSelected.has(path));
+            const cb = card.querySelector('.file-card-check input');
+            if (cb) cb.checked = batchSelected.has(path);
+            return;
+        }
+        e.stopPropagation();
+        const path = card.dataset.path, type = card.dataset.type;
+        if (isGlobalSearch && type === 'file') {
+            openSearchResultItem(getFileListItem(path) || { path, type });
+            return;
+        }
+        if (!batchMode && isDesktopGalleryInput() && (e.ctrlKey || e.metaKey || e.shiftKey)) {
+            enterBatchMode(path, type);
+            return;
+        }
+        if (batchMode) {
+            toggleBatchSelection(path, type);
+            card.classList.toggle('is-batch-selected', batchSelected.has(path));
+            const cb = card.querySelector('.file-card-check input');
+            if (cb) cb.checked = batchSelected.has(path);
+            return;
+        }
+        if (type === 'dir') loadFiles(path);
+        else showImageViewer(path);
+    });
+
+    grid.addEventListener('contextmenu', (e) => {
+        if (batchMode) return;
+        const card = e.target.closest('.file-card');
+        if (!card || e.target.closest('.file-card-menu')) return;
+        e.preventDefault();
+        e.stopPropagation();
+        selectedItem = getFileListItem(card.dataset.path) || { path: card.dataset.path, type: card.dataset.type };
+        showContextMenu(e.clientX, e.clientY, card.dataset.type);
+    });
+
+    // 长按（触屏）改为 grid 委托，避免每卡片绑定
+    let lpTimer = null;
+    let lpCard = null;
+    const lpCancel = () => { if (lpTimer) { clearTimeout(lpTimer); lpTimer = null; } lpCard = null; };
+    grid.addEventListener('touchstart', (e) => {
+        if (batchMode) return;
+        const card = e.target.closest('.file-card');
+        if (!card || e.target.closest('.file-card-menu')) return;
+        lpCard = card;
+        lpTimer = setTimeout(() => {
+            lpTimer = null;
+            if (!lpCard || !lpCard.isConnected) return;
+            selectedItem = getFileListItem(lpCard.dataset.path) || { path: lpCard.dataset.path, type: lpCard.dataset.type };
+            const rect = lpCard.getBoundingClientRect();
+            showContextMenu(rect.left + rect.width / 2, rect.top + 20, lpCard.dataset.type);
+        }, 500);
+    }, { passive: true });
+    grid.addEventListener('touchmove', lpCancel, { passive: true });
+    grid.addEventListener('touchend', lpCancel);
+    grid.addEventListener('touchcancel', lpCancel);
+}
+
 function renderFileGrid() {
     const grid = document.getElementById('file-grid');
     if (!grid) return;
@@ -2432,7 +2595,7 @@ function renderFileGrid() {
         updateSearchStatus();
         return;
     }
-    if (items.length===0) {
+    if (items.length === 0) {
         const emptyText = isSearchActive()
             ? (isGlobalSearch ? '未找到匹配的文件' : '当前目录无匹配项')
             : '空文件夹';
@@ -2441,85 +2604,40 @@ function renderFileGrid() {
         return;
     }
     const canUpload = hasUploadPerm();
-    grid.innerHTML = items.map(item => {
-        const selected = batchSelected.has(item.path);
-        const pathHint = showPathHint
-            ? `<div class="file-path-hint" title="${escapeHtml(formatSearchItemPath(item))}">${escapeHtml(formatSearchItemPath(item))}</div>`
-            : '';
-        return `
-        <div class="file-card${batchMode ? ' file-card--batch' : ''}${selected ? ' is-batch-selected' : ''}" data-path="${escapeHtml(item.path || '')}" data-type="${item.type}">
-            ${!batchMode && !isGlobalSearch && (canUpload || item.type === 'file') ? `<button class="file-card-menu" type="button" aria-label="更多操作" data-path="${escapeHtml(item.path || '')}" data-type="${item.type}">
-                <span class="icon">more_vert</span>
-            </button>` : ''}
-            ${batchMode ? `<label class="file-card-check" aria-label="选择"><input type="checkbox"${selected ? ' checked' : ''}></label>` : ''}
-            <div class="file-preview${isImageItem(item) ? ' file-preview--image' : ''}">${getPreviewHtml(item)}</div>
-            <div class="file-name">${escapeHtml(item.name)}</div>
-            ${pathHint}
-        </div>`;
-    }).join('') + (
-        isGlobalSearch && searchResults && searchResults.length < searchTotal
-            ? `<div class="search-load-more-wrap" style="grid-column:1/-1;"><button type="button" class="btn btn-outlined" id="search-load-more">加载更多（${searchResults.length}/${searchTotal}）</button></div>`
-            : ''
-    );
+
+    // 取消上一轮未完成的分块渲染
+    gridRenderSeq++;
+    const seq = gridRenderSeq;
+    bindGridGestures(grid);
+
+    const total = items.length;
+    const buildChunk = (start, end) => items.slice(start, end)
+        .map(item => buildFileCardHtml(item, { batchMode, showPathHint, canUpload }))
+        .join('');
+
+    // 第一块立即渲染并启动可见缩略图加载，其余块让出主线程后追加
+    grid.innerHTML = buildChunk(0, Math.min(GRID_CHUNK_SIZE, total)) || '';
     initPreviewImages();
-    bindSearchLoadMore();
-    document.querySelectorAll('.file-card').forEach(card=>{
-        card.addEventListener('click',(e)=>{
-            if (e.target.closest('.file-card-menu') || e.target.closest('.file-card-check')) return;
-            e.stopPropagation();
-            const path=card.dataset.path, type=card.dataset.type;
-            if (isGlobalSearch && type === 'file') {
-                openSearchResultItem(getFileListItem(path) || { path, type });
-                return;
-            }
-            if (!batchMode && isDesktopGalleryInput() && (e.ctrlKey || e.metaKey || e.shiftKey)) {
-                enterBatchMode(path, type);
-                return;
-            }
-            if (batchMode) {
-                toggleBatchSelection(path, type);
-                card.classList.toggle('is-batch-selected', batchSelected.has(path));
-                const cb = card.querySelector('.file-card-check input');
-                if (cb) cb.checked = batchSelected.has(path);
-                return;
-            }
-            if(type==='dir') loadFiles(path);
-            else showImageViewer(path);
-        });
-        card.querySelector('.file-card-check input')?.addEventListener('click', (e) => {
-            e.stopPropagation();
-            const path = card.dataset.path;
-            const type = card.dataset.type;
-            toggleBatchSelection(path, type);
-            card.classList.toggle('is-batch-selected', batchSelected.has(path));
-            e.target.checked = batchSelected.has(path);
-        });
-        if (!batchMode) {
-            card.addEventListener('contextmenu',(e)=>{
-                e.preventDefault();
-                e.stopPropagation();
-                selectedItem = getFileListItem(card.dataset.path) || { path: card.dataset.path, type: card.dataset.type };
-                showContextMenu(e.clientX, e.clientY, card.dataset.type);
-            });
-            initLongPress(card, () => {
-                selectedItem = getFileListItem(card.dataset.path) || { path: card.dataset.path, type: card.dataset.type };
-                const rect = card.getBoundingClientRect();
-                showContextMenu(rect.left + rect.width / 2, rect.top + 20, card.dataset.type);
-            });
-        }
-    });
-    if (!batchMode) {
-        document.querySelectorAll('.file-card-menu').forEach(btn => {
-            btn.addEventListener('click', (e) => {
-                e.stopPropagation();
-                selectedItem = getFileListItem(btn.dataset.path) || { path: btn.dataset.path, type: btn.dataset.type };
-                const rect = btn.getBoundingClientRect();
-                showContextMenu(rect.left, rect.bottom + 4, btn.dataset.type);
-            });
-        });
-    }
     updateBatchBar();
-    updateSearchStatus();
+
+    const appendRest = (start) => {
+        if (seq !== gridRenderSeq) return; // 已被新一轮渲染取代
+        const end = Math.min(start + GRID_CHUNK_SIZE, total);
+        grid.insertAdjacentHTML('beforeend', buildChunk(start, end));
+        initPreviewImages();
+        if (end < total) {
+            setTimeout(() => appendRest(end), 0);
+        } else {
+            bindSearchLoadMore();
+            updateSearchStatus();
+        }
+    };
+    if (GRID_CHUNK_SIZE < total) {
+        setTimeout(() => appendRest(GRID_CHUNK_SIZE), 0);
+    } else {
+        bindSearchLoadMore();
+        updateSearchStatus();
+    }
 }
 
 function bindBatchBarActions() {
@@ -2633,22 +2751,6 @@ async function batchCopyItems() {
     } finally {
         uiLoadingHide();
     }
-}
-
-function initLongPress(el, callback, delay = 500) {
-    let timer = null;
-    let moved = false;
-    const start = (e) => {
-        if (e.target.closest('.file-card-menu')) return;
-        moved = false;
-        timer = setTimeout(() => { callback(); }, delay);
-    };
-    const cancel = () => { if (timer) { clearTimeout(timer); timer = null; } };
-    const move = () => { moved = true; cancel(); };
-    el.addEventListener('touchstart', start, { passive: true });
-    el.addEventListener('touchmove', move, { passive: true });
-    el.addEventListener('touchend', cancel);
-    el.addEventListener('touchcancel', cancel);
 }
 
 function isViewerMobileLayout() {

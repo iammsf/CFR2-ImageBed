@@ -4,7 +4,9 @@
 
 const CACHE_SETTINGS = 'https://imgbed.internal/settings';
 const CACHE_INSTALL = 'https://imgbed.internal/install-status';
+const CACHE_LIST_VERSION = 'https://imgbed.internal/list-version';
 const FILE_LIST_COLUMNS = 'path, name, parent, type, size, mime, uploaded_at, hash, uploaded_by';
+const FILE_LIST_CACHE_TTL = 60; // 列表边缘缓存秒数；写操作通过版本号立即失效
 
 let jwtVerifyKeyPromise = null;
 let jwtVerifyKeySecret = null;
@@ -261,7 +263,8 @@ async function handleApiInner(request, action, env, ctx) {
         case 'files': {
             if (!hasViewPermission(user)) return jsonResponse({ error: 'Forbidden' }, 403);
             const parent = normalizeParent(url.searchParams.get('parent') || '/');
-            return jsonResponse(await listFiles(parent, env));
+            const fresh = url.searchParams.get('fresh') === '1';
+            return jsonResponse(await listFiles(parent, env, ctx, { fresh }));
         }
         case 'search':
             if (method !== 'GET') return jsonResponse({ error: 'Method not allowed' }, 405);
@@ -281,6 +284,7 @@ async function handleApiInner(request, action, env, ctx) {
             {
                 const full = url.searchParams.get('mode') === 'full';
                 const stats = await syncR2ToDB(env, { full });
+                await bumpListVersion(env);
                 return jsonResponse({ success: true, ...stats });
             }
         case 'check-hash':
@@ -289,7 +293,11 @@ async function handleApiInner(request, action, env, ctx) {
             return handleCheckHash(request, user, env, ctx);
         case 'upload':
             if (!hasUploadPermission(user)) return jsonResponse({ error: 'Forbidden' }, 403);
-            return await handleUpload(request, user, env, ctx);
+            {
+                const resp = await handleUpload(request, user, env, ctx);
+                await bumpListVersion(env);
+                return resp;
+            }
         case 'mkdir': {
             if (!hasUploadPermission(user)) return jsonResponse({ error: 'Forbidden' }, 403);
             const { path: folderPath } = await parseJsonBody(request);
@@ -298,20 +306,37 @@ async function handleApiInner(request, action, env, ctx) {
             const normalized = normalizeDbDirPath(folderPath);
             const slash = normalized.lastIndexOf('/');
             const parent = slash <= 0 ? '/' : normalized.slice(0, slash);
+            await bumpListVersion(env);
             return jsonResponse({ success: true, folder, parent });
         }
         case 'move':
             if (!hasUploadPermission(user)) return jsonResponse({ error: 'Forbidden' }, 403);
-            return await handleMove(request, user, env);
+            {
+                const resp = await handleMove(request, user, env);
+                await bumpListVersion(env);
+                return resp;
+            }
         case 'copy':
             if (!hasUploadPermission(user)) return jsonResponse({ error: 'Forbidden' }, 403);
-            return await handleCopy(request, user, env);
+            {
+                const resp = await handleCopy(request, user, env);
+                await bumpListVersion(env);
+                return resp;
+            }
         case 'rename':
             if (!hasUploadPermission(user)) return jsonResponse({ error: 'Forbidden' }, 403);
-            return await handleRename(request, user, env);
+            {
+                const resp = await handleRename(request, user, env);
+                await bumpListVersion(env);
+                return resp;
+            }
         case 'delete':
             if (!hasUploadPermission(user)) return jsonResponse({ error: 'Forbidden' }, 403);
-            return await handleDelete(request, user, env);
+            {
+                const resp = await handleDelete(request, user, env);
+                await bumpListVersion(env);
+                return resp;
+            }
         case 'stats':
             return jsonResponse(await getStats(env));
         default:
@@ -325,7 +350,7 @@ async function handleBootstrap(url, user, env, ctx) {
     const parent = normalizeParent(url.searchParams.get('parent') || '/');
     const [settings, files, userRecord] = await Promise.all([
         getSettings(env, ctx),
-        listFiles(parent, env),
+        listFiles(parent, env, ctx),
         env.DB.prepare(
             'SELECT id, username, nickname, role, perm_upload, perm_view, perm_manage FROM users WHERE id = ?'
         ).bind(user.id).first()
@@ -411,11 +436,34 @@ async function checkNeedInstall(env, ctx) {
     }
 }
 
-async function listFiles(parent, env) {
+async function getListVersion(env) {
+    const cached = await readCache(CACHE_LIST_VERSION);
+    if (cached && Number.isFinite(cached.v)) return cached.v;
+    return 0;
+}
+
+/** 任何 items 写操作后调用：换一批列表缓存 key，同 colo 内立即生效 */
+async function bumpListVersion(env) {
+    const current = await getListVersion(env);
+    await writeCache(CACHE_LIST_VERSION, { v: current + 1 }, 86400);
+}
+
+/**
+ * 目录列表边缘缓存：内容与用户无关（权限已在入口校验），key = 版本 + 目录。
+ * caches.default 按 colo 隔离，跨 colo 最长过期 60s。
+ */
+async function listFiles(parent, env, ctx, { fresh = false } = {}) {
+    const cacheKey = `https://imgbed.internal/files/${await getListVersion(env)}:${parent}`;
+    if (!fresh) {
+        const cached = await readCache(cacheKey);
+        if (cached) return cached;
+    }
     const items = await env.DB.prepare(
         `SELECT ${FILE_LIST_COLUMNS} FROM items WHERE parent = ? ORDER BY type DESC, name ASC`
     ).bind(parent).all();
-    return items.results;
+    const results = items.results;
+    if (ctx && !fresh) ctx.waitUntil(writeCache(cacheKey, results, FILE_LIST_CACHE_TTL));
+    return results;
 }
 
 async function listAllFolders(env) {
